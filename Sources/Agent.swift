@@ -45,24 +45,53 @@ protocol AgentKeyStore {
     throws -> Data
 }
 
+/// Password kept in locked (unswappable) memory, zeroed when released
+final class SecretBuffer {
+  private let pointer: UnsafeMutableRawPointer
+  let count: Int
+
+  init(_ data: Data) {
+    count = data.count
+    pointer = UnsafeMutableRawPointer.allocate(byteCount: max(count, 1), alignment: 1)
+    mlock(pointer, max(count, 1))
+    data.copyBytes(to: pointer.assumingMemoryBound(to: UInt8.self), count: count)
+  }
+
+  var data: Data {
+    return Data(bytes: pointer, count: count)
+  }
+
+  deinit {
+    memset_s(pointer, max(count, 1), 0, max(count, 1))
+    munlock(pointer, max(count, 1))
+    pointer.deallocate()
+  }
+}
+
 /// Agent state: authorizations of unlocked keys
 final class AgentState: @unchecked Sendable {
   struct Entry {
-    let authorization: AnyObject
+    var authorization: AnyObject
+    /// Kept to recreate the authorization if the system invalidates it (e.g. around sleep)
+    let password: SecretBuffer
     let unlockedAt: Date
   }
 
   let keyStore: AgentKeyStore
   let timeout: TimeInterval?
   let now: () -> Date
+  let log: (String) -> Void
   private var entries: [Data: Entry] = [:]
   private let lock = NSLock()
 
-  init(keyStore: AgentKeyStore, timeout: TimeInterval? = nil, now: @escaping () -> Date = Date.init)
-  {
+  init(
+    keyStore: AgentKeyStore, timeout: TimeInterval? = nil, now: @escaping () -> Date = Date.init,
+    log: @escaping (String) -> Void = { FileHandle.standardError.write(Data("\($0)\n".utf8)) }
+  ) {
     self.keyStore = keyStore
     self.timeout = timeout
     self.now = now
+    self.log = log
   }
 
   func handle(_ request: AgentRequest) -> AgentResponse {
@@ -81,7 +110,8 @@ final class AgentState: @unchecked Sendable {
           throw AgentError.invalid("missing key or password")
         }
         let authorization = try keyStore.authorize(key: key, password: password)
-        entries[AgentState.keyID(key)] = Entry(authorization: authorization, unlockedAt: now())
+        entries[AgentState.keyID(key)] = Entry(
+          authorization: authorization, password: SecretBuffer(password), unlockedAt: now())
         return AgentResponse()
       case "ecdh":
         guard let key = request.key, let shareData = request.share else {
@@ -101,11 +131,23 @@ final class AgentState: @unchecked Sendable {
               key: key, authorization: entry.authorization, share: share))
         } catch let error as AgentError {
           // The key cannot be used right now (e.g. the Mac is locked), but stays unlocked
+          log("key agreement failed: \(error.localizedDescription)")
           throw error
         } catch {
-          // The authorization may have been invalidated by the system
-          entries[id] = nil
-          throw AgentError.locked
+          // The system may have invalidated the authorization: recreate it from the password
+          log("key agreement failed, reauthorizing: \(error)")
+          let authorization: AnyObject
+          do {
+            authorization = try keyStore.authorize(key: key, password: entry.password.data)
+          } catch AgentError.badPassword {
+            log("password no longer accepted, locking key")
+            entries[id] = nil
+            throw AgentError.locked
+          }
+          entries[id]?.authorization = authorization
+          return AgentResponse(
+            secret: try keyStore.sharedSecret(key: key, authorization: authorization, share: share)
+          )
         }
       default:
         throw AgentError.invalid("unknown operation `\(request.op)`")
@@ -157,7 +199,15 @@ final class AgentState: @unchecked Sendable {
         let _: SharedSecret = try privateKey.sharedSecretFromKeyAgreement(
           with: P256.KeyAgreement.PrivateKey().publicKey)
       } catch {
-        throw SecureEnclaveKeyStore.unavailableError(error) ?? AgentError.badPassword
+        if let unavailable = SecureEnclaveKeyStore.unavailableError(error) {
+          throw unavailable
+        }
+        // An incorrect application password fails the operation in CryptoTokenKit
+        let nsError = error as NSError
+        if nsError.domain == "CryptoTokenKit" && nsError.code == -3 {
+          throw AgentError.badPassword
+        }
+        throw AgentError.internal("\(error)")
       }
       return context
     }

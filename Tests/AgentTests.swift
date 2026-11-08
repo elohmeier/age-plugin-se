@@ -283,12 +283,15 @@ final class ApplicationPasswordIdentityTests: XCTestCase {
 /// Key store that requires the password "secret" for all keys (which are raw P-256 keys)
 class DummyKeyStore: AgentKeyStore {
   var unavailable = false
+  var invalidated = false
+  var password = Data("secret".utf8)
 
   func authorize(key: Data, password: Data) throws -> AnyObject {
     if unavailable {
       throw AgentError.unavailable("unavailable")
     }
-    if password != Data("secret".utf8) {
+    invalidated = false
+    if password != self.password {
       throw AgentError.badPassword
     }
     return NSObject()
@@ -299,6 +302,9 @@ class DummyKeyStore: AgentKeyStore {
   {
     if unavailable {
       throw AgentError.unavailable("unavailable")
+    }
+    if invalidated {
+      throw DummyCryptoError.dummyError
     }
     return try P256.KeyAgreement.PrivateKey(rawRepresentation: key)
       .sharedSecretFromKeyAgreement(with: share).withUnsafeBytes { Data($0) }
@@ -349,6 +355,21 @@ final class AgentStateTests: XCTestCase {
     keyStore.unavailable = false
     // Still unlocked afterwards
     XCTAssertTrue(ecdh(state).ok)
+  }
+
+  func testInvalidatedAuthorization() throws {
+    let keyStore = DummyKeyStore()
+    let state = AgentState(keyStore: keyStore, log: { _ in })
+    XCTAssertTrue(unlock(state, "secret").ok)
+    keyStore.invalidated = true
+    // Recreated from the stored password
+    XCTAssertTrue(ecdh(state).ok)
+    XCTAssertFalse(keyStore.invalidated)
+    // Password no longer accepted
+    keyStore.invalidated = true
+    keyStore.password = Data("changed".utf8)
+    XCTAssertEqual("locked", ecdh(state).error)
+    XCTAssertEqual(0, state.handle(AgentRequest(op: "status")).unlocked)
   }
 
   func testTimeout() throws {
