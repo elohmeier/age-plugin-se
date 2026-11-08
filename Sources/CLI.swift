@@ -14,6 +14,10 @@ struct CLI {
       case .version:
         print(version)
       case .keygen:
+        if let outputFile = options.output {
+          // Check before creating the key, so the key is never lost
+          try checkOutputFile(outputFile)
+        }
         var applicationPassword: Data? = nil
         if options.accessControl == .applicationPassword {
           #if os(macOS)
@@ -28,11 +32,7 @@ struct CLI {
           recipientType: options.recipientType.recipientType, now: Date(),
           pq: options.pq, applicationPassword: applicationPassword)
         if let outputFile = options.output {
-          FileManager.default.createFile(
-            atPath: outputFile,
-            contents: Data(result.0.utf8),
-            attributes: [.posixPermissions: 0o600]
-          )
+          try writeOutputFile(outputFile, contents: result.0)
           print("Public key: \(result.1)")
         } else {
           print(result.0)
@@ -47,11 +47,7 @@ struct CLI {
         let result = try plugin.generateRecipients(
           input: input, recipientType: options.recipientType.recipientType, pq: options.pq)
         if let outputFile = options.output {
-          FileManager.default.createFile(
-            atPath: outputFile,
-            contents: Data(result.utf8),
-            attributes: [.posixPermissions: 0o600]
-          )
+          try writeOutputFile(outputFile, contents: result, overwrite: true)
         } else if result != "" {
           print(result)
         }
@@ -76,6 +72,45 @@ struct CLI {
       print("\(CommandLine.arguments[0]): error: \(error.localizedDescription)")
       exit(-1)
     }
+  }
+}
+
+enum OutputError: LocalizedError {
+  case exists(String)
+  case missingDirectory(String)
+  case writeFailed(String)
+
+  public var errorDescription: String? {
+    switch self {
+    case .exists(let path): return "output file already exists: \(path)"
+    case .missingDirectory(let path): return "directory does not exist: \(path)"
+    case .writeFailed(let path): return "cannot write output file: \(path)"
+    }
+  }
+}
+
+func checkOutputFile(_ path: String) throws {
+  if FileManager.default.fileExists(atPath: path) {
+    throw OutputError.exists(path)
+  }
+  let directory = (path as NSString).deletingLastPathComponent
+  var isDirectory: ObjCBool = false
+  if !directory.isEmpty
+    && !(FileManager.default.fileExists(atPath: directory, isDirectory: &isDirectory)
+      && isDirectory.boolValue)
+  {
+    throw OutputError.missingDirectory(directory)
+  }
+}
+
+func writeOutputFile(_ path: String, contents: String, overwrite: Bool = false) throws {
+  if !overwrite {
+    try checkOutputFile(path)
+  }
+  if !FileManager.default.createFile(
+    atPath: path, contents: Data(contents.utf8), attributes: [.posixPermissions: 0o600])
+  {
+    throw OutputError.writeFailed(path)
   }
 }
 
