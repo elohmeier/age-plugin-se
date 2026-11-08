@@ -49,6 +49,9 @@ class DummyCrypto: Crypto {
 
   var isSecureEnclaveAvailable = true
   var failingOperations = false
+  // Application password the dummy keys require (nil: no password needed)
+  var requiredApplicationPassword: Data?
+  var applicationPassword: Data?
 
   func newSecureEnclaveP256PrivateKey(dataRepresentation: Data) throws
     -> SecureEnclaveP256PrivateKey
@@ -87,6 +90,10 @@ class DummyCrypto: Crypto {
       crypto: self)
   }
 
+  func setApplicationPassword(_ password: Data) throws {
+    applicationPassword = password
+  }
+
   func encapsulate(mlkem768Key: MLKEM768.PublicKey) throws -> KEM.EncapsulationResult {
     return dummyEncapsulations.popLast()!
     // let enc = try mlkem768Key.encapsulate()
@@ -110,12 +117,17 @@ struct DummySecureEnclaveP256PrivateKey: SecureEnclaveP256PrivateKey {
   }
 
   func sharedSecretFromKeyAgreement(with publicKeyShare: P256.KeyAgreement.PublicKey) throws
-    -> SharedSecret
+    -> Data
   {
     if crypto.failingOperations {
       throw DummyCryptoError.dummyError
     }
-    return try key.sharedSecretFromKeyAgreement(with: publicKeyShare)
+    if let required = crypto.requiredApplicationPassword,
+      crypto.applicationPassword != required
+    {
+      throw DummyCryptoError.wrongPassword
+    }
+    return try key.sharedSecretFromKeyAgreement(with: publicKeyShare).withUnsafeBytes { Data($0) }
   }
 }
 
@@ -138,10 +150,12 @@ struct DummySecureEnclaveMLKEM768PrivateKey: SecureEnclaveMLKEM768PrivateKey {
 
 enum DummyCryptoError: LocalizedError {
   case dummyError
+  case wrongPassword
 
   public var errorDescription: String? {
     switch self {
     case .dummyError: return "dummy error"
+    case .wrongPassword: return "wrong password"
     }
   }
 }

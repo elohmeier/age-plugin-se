@@ -215,6 +215,20 @@ If you should ever lose access to the device bound to your private key:
    ```
 
 
+### Entering a password once per login
+
+Instead of Touch ID or the system passcode, a key can be protected by a password of your choice
+(checked by the Secure Enclave), which you only need to enter once per login by running the
+unlock agent:
+
+```
+$ age-plugin-se keygen --access-control application-password --recipient-type tag -o key.txt
+$ age-plugin-se agent &
+```
+
+The first decryption asks for the password and unlocks the key in the agent; later decryptions
+don't ask again. See [AGENT.md](AGENT.md) for details.
+
 ### Converting `age-plugin-se` recipients to `age-plugin-tag` recipients
 
 `age-plugin-se` can generate two types of recipients (using the

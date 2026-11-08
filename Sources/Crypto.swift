@@ -59,14 +59,18 @@ protocol Crypto {
   func newSecureEnclaveMLKEM768PrivateKey(accessControl: SecAccessControl) throws
     -> SecureEnclaveMLKEM768PrivateKey
   func encapsulate(mlkem768Key: MLKEM768.PublicKey) throws -> KEM.EncapsulationResult
+
+  /// Authorizes subsequent Secure Enclave key operations with an application password.
+  func setApplicationPassword(_ password: Data) throws
 }
 
 protocol SecureEnclaveP256PrivateKey {
   var publicKey: P256.KeyAgreement.PublicKey { get }
   var dataRepresentation: Data { get }
 
+  /// Raw ECDH shared secret (the x-coordinate of the shared point).
   func sharedSecretFromKeyAgreement(with publicKeyShare: P256.KeyAgreement.PublicKey) throws
-    -> SharedSecret
+    -> Data
 }
 
 protocol SecureEnclaveMLKEM768PrivateKey {
@@ -132,9 +136,21 @@ protocol SecureEnclaveMLKEM768PrivateKey {
     func encapsulate(mlkem768Key: MLKEM768.PublicKey) throws -> KEM.EncapsulationResult {
       return try mlkem768Key.encapsulate()
     }
+
+    func setApplicationPassword(_ password: Data) throws {
+      if !context.setCredential(password, type: .applicationPassword) {
+        throw Plugin.Error.applicationPasswordUnavailable
+      }
+    }
   }
 
   extension SecureEnclave.P256.KeyAgreement.PrivateKey: SecureEnclaveP256PrivateKey {
+    func sharedSecretFromKeyAgreement(with publicKeyShare: P256.KeyAgreement.PublicKey) throws
+      -> Data
+    {
+      let sharedSecret: SharedSecret = try sharedSecretFromKeyAgreement(with: publicKeyShare)
+      return sharedSecret.withUnsafeBytes { Data($0) }
+    }
   }
 
   #if compiler(>=6.2)
@@ -179,6 +195,10 @@ protocol SecureEnclaveMLKEM768PrivateKey {
 
     func encapsulate(mlkem768Key: MLKEM768.PublicKey) throws -> KEM.EncapsulationResult {
       return try mlkem768Key.encapsulate()
+    }
+
+    func setApplicationPassword(_ password: Data) throws {
+      throw Plugin.Error.seUnsupported
     }
   }
 

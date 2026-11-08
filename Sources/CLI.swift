@@ -14,10 +14,19 @@ struct CLI {
       case .version:
         print(version)
       case .keygen:
+        var applicationPassword: Data? = nil
+        if options.accessControl == .applicationPassword {
+          #if os(macOS)
+            applicationPassword = try PasswordPrompt.readNew(
+              description: "Enter a password to protect the new key")
+          #else
+            throw Plugin.Error.seUnsupported
+          #endif
+        }
         let result = try plugin.generateKey(
           accessControl: options.accessControl.keyAccessControl,
           recipientType: options.recipientType.recipientType, now: Date(),
-          pq: options.pq)
+          pq: options.pq, applicationPassword: applicationPassword)
         if let outputFile = options.output {
           FileManager.default.createFile(
             atPath: outputFile,
@@ -51,8 +60,17 @@ struct CLI {
         case .recipientV1:
           plugin.runRecipientV1()
         case .identityV1:
+          #if os(macOS)
+            plugin.agent = UnixSocketAgentClient.available()
+          #endif
           plugin.runIdentityV1()
         }
+      case .agent, .unlock, .lock, .status:
+        #if os(macOS)
+          try AgentCLI.run(options, crypto: plugin.crypto)
+        #else
+          throw Plugin.Error.seUnsupported
+        #endif
       }
     } catch {
       print("\(CommandLine.arguments[0]): error: \(error.localizedDescription)")
@@ -89,6 +107,10 @@ struct Options {
     case keygen
     case recipients
     case plugin(StateMachine)
+    case agent
+    case unlock
+    case lock
+    case status
   }
   var command: Command
 
@@ -96,6 +118,11 @@ struct Options {
   var input: String?
 
   var pq: Bool = false
+
+  var socket: String?
+  var timeout: TimeInterval?
+  var lockOnSleep = false
+  var lockOnScreenLock = false
 
   enum AccessControl: String {
     case none = "none"
@@ -105,6 +132,7 @@ struct Options {
     case anyBiometryAndPasscode = "any-biometry-and-passcode"
     case currentBiometry = "current-biometry"
     case currentBiometryAndPasscode = "current-biometry-and-passcode"
+    case applicationPassword = "application-password"
 
     var keyAccessControl: KeyAccessControl {
       switch self {
@@ -115,6 +143,7 @@ struct Options {
       case .anyBiometryAndPasscode: return KeyAccessControl.anyBiometryAndPasscode
       case .currentBiometry: return KeyAccessControl.currentBiometry
       case .currentBiometryAndPasscode: return KeyAccessControl.currentBiometryAndPasscode
+      case .applicationPassword: return KeyAccessControl.applicationPassword
       }
     }
   }
@@ -139,6 +168,10 @@ struct Options {
     Usage:
       age-plugin-se keygen [--pq] [-o OUTPUT] [--access-control ACCESS_CONTROL] [--recipient-type RECIPIENT_TYPE]
       age-plugin-se recipients [--pq] [-o OUTPUT] [-i INPUT] [--recipient-type RECIPIENT_TYPE]
+      age-plugin-se agent [--socket SOCKET] [--timeout SECONDS] [--lock-on-sleep] [--lock-on-screen-lock]
+      age-plugin-se unlock [--socket SOCKET] [-i INPUT]
+      age-plugin-se lock [--socket SOCKET]
+      age-plugin-se status [--socket SOCKET]
 
     Description:
       The `keygen` subcommand generates a new private key bound to the current 
@@ -149,6 +182,20 @@ struct Options {
       input, and outputs the corresponding recipient(s) to OUTPUT or to standard 
       output.
 
+      The `agent` subcommand runs an agent that keeps keys protected by an
+      application password unlocked, so that the password only needs to be
+      entered once (e.g. once per login). The plug-in uses the agent when it is
+      running, and unlocks keys in the agent on first use. Keys stay unlocked
+      until `lock`, until TIMEOUT seconds have passed, or until the agent stops.
+
+      The `unlock` subcommand unlocks the application password keys of the
+      identity file INPUT (or standard input) in the agent, asking for the
+      password on the terminal, or using pinentry (PINENTRY_PROGRAM, default
+      pinentry-mac) if there is no terminal.
+
+      The `lock` subcommand locks all keys in the agent. The `status`
+      subcommand shows how many keys are unlocked.
+
     Options:
       --access-control ACCESS_CONTROL   Access control for using the generated key.
                                         
@@ -156,10 +203,16 @@ struct Options {
                                         fingerprint stops the key from working. Removing an 
                                         added fingerprint enables the key again. 
 
+                                        `application-password` protects the key with a
+                                        password of your choice, which is checked by the
+                                        Secure Enclave. Use the agent to enter it only
+                                        once. Not supported for post-quantum keys.
+
                                         Supported values: none, passcode, 
                                           any-biometry, any-biometry-and-passcode, 
                                           any-biometry-or-passcode, current-biometry, 
-                                          current-biometry-and-passcode
+                                          current-biometry-and-passcode,
+                                          application-password
                                         Default: any-biometry-or-passcode.                          
 
       -i, --input INPUT                 Read data from the file at path INPUT
@@ -167,6 +220,15 @@ struct Options {
       -o, --output OUTPUT               Write the result to the file at path OUTPUT
 
       --pq                              Generate post-quantum keys
+
+      --socket SOCKET                   Agent socket path. Default: $AGE_PLUGIN_SE_AGENT_SOCK, or
+                                        ~/Library/Application Support/age-plugin-se/agent.sock
+
+      --timeout SECONDS                 Lock keys this many seconds after unlocking them
+
+      --lock-on-sleep                   Lock keys when the system goes to sleep
+
+      --lock-on-screen-lock             Lock keys when the screen is locked
 
       --recipient-type RECIPIENT_TYPE   Recipient type to generate.
 
@@ -197,6 +259,18 @@ struct Options {
         opts.command = .keygen
       } else if arg == "recipients" {
         opts.command = .recipients
+      } else if arg == "agent" {
+        opts.command = .agent
+      } else if arg == "unlock" {
+        opts.command = .unlock
+      } else if arg == "lock" {
+        opts.command = .lock
+      } else if arg == "status" {
+        opts.command = .status
+      } else if arg == "--lock-on-sleep" {
+        opts.lockOnSleep = true
+      } else if arg == "--lock-on-screen-lock" {
+        opts.lockOnScreenLock = true
       } else if ["--help", "-h"].contains(arg) {
         opts.command = .help
         break
@@ -207,6 +281,7 @@ struct Options {
         opts.pq = true
       } else if [
         "--age-plugin", "-i", "--input", "-o", "--output", "--access-control", "--recipient-type",
+        "--socket", "--timeout",
       ].contains(where: {
         arg == $0 || arg.hasPrefix($0 + "=")
       }) {
@@ -236,6 +311,13 @@ struct Options {
         case "--recipient-type":
           opts.recipientType =
             try RecipientType(rawValue: value) ?? { throw Error.invalidValue(arg, value) }()
+        case "--socket":
+          opts.socket = value
+        case "--timeout":
+          guard let timeout = TimeInterval(value), timeout > 0 else {
+            throw Error.invalidValue(arg, value)
+          }
+          opts.timeout = timeout
         default:
           assert(false)
         }

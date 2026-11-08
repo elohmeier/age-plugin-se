@@ -126,4 +126,40 @@ final class OptionsTests: XCTestCase {
       XCTAssertEqual(Options.Error.missingValue("--output"), error as! Options.Error)
     }
   }
+
+  func testParse_Keygen_ApplicationPassword() throws {
+    let options = try Options.parse(["_", "keygen", "--access-control=application-password"])
+    XCTAssertEqual(.keygen, options.command)
+    XCTAssertEqual(.applicationPassword, options.accessControl)
+  }
+
+  func testParse_Agent() throws {
+    let options = try Options.parse([
+      "_", "agent", "--socket", "/tmp/agent.sock", "--timeout=3600", "--lock-on-sleep",
+      "--lock-on-screen-lock",
+    ])
+    XCTAssertEqual(.agent, options.command)
+    XCTAssertEqual("/tmp/agent.sock", options.socket)
+    XCTAssertEqual(3600, options.timeout)
+    XCTAssertTrue(options.lockOnSleep)
+    XCTAssertTrue(options.lockOnScreenLock)
+  }
+
+  func testParse_Agent_InvalidTimeout() throws {
+    XCTAssertThrowsError(try Options.parse(["_", "agent", "--timeout=-1"])) { error in
+      XCTAssertEqual(Options.Error.invalidValue("--timeout", "-1"), error as! Options.Error)
+    }
+  }
+
+  func testParse_Unlock() throws {
+    let options = try Options.parse(["_", "unlock", "-i", "key.txt"])
+    XCTAssertEqual(.unlock, options.command)
+    XCTAssertEqual("key.txt", options.input)
+    XCTAssertFalse(options.lockOnSleep)
+  }
+
+  func testParse_LockStatus() throws {
+    XCTAssertEqual(.lock, try Options.parse(["_", "lock"]).command)
+    XCTAssertEqual(.status, try Options.parse(["_", "status"]).command)
+  }
 }

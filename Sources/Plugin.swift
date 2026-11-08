@@ -9,17 +9,30 @@ import Foundation
 class Plugin {
   var crypto: Crypto
   var stream: Stream
+  /// Agent holding unlocked application-password keys, if one is running
+  var agent: AgentClient?
 
-  init(crypto: Crypto, stream: Stream) {
+  init(crypto: Crypto, stream: Stream, agent: AgentClient? = nil) {
     self.crypto = crypto
     self.stream = stream
+    self.agent = agent
   }
 
   func generateKey(
-    accessControl: KeyAccessControl, recipientType: RecipientType, now: Date, pq: Bool = false
+    accessControl: KeyAccessControl, recipientType: RecipientType, now: Date, pq: Bool = false,
+    applicationPassword: Data? = nil
   ) throws -> (String, String) {
     if !crypto.isSecureEnclaveAvailable {
       throw Error.seUnsupported
+    }
+    if accessControl == .applicationPassword {
+      if pq {
+        throw Error.applicationPasswordPQ
+      }
+      guard let applicationPassword = applicationPassword, !applicationPassword.isEmpty else {
+        throw Error.applicationPasswordMissing
+      }
+      try crypto.setApplicationPassword(applicationPassword)
     }
     #if compiler(>=6.2)
       let createdAt = now.ISO8601Format()
@@ -42,6 +55,9 @@ class Plugin {
       if accessControl == .anyBiometryOrPasscode {
         accessControlFlags.insert(.userPresence)
       }
+      if accessControl == .applicationPassword {
+        accessControlFlags.insert(.applicationPassword)
+      }
       var error: Unmanaged<CFError>?
       guard
         let secAccessControl = SecAccessControlCreateWithFlags(
@@ -55,7 +71,9 @@ class Plugin {
       let secAccessControl = SecAccessControl()
     #endif
 
-    let identity = try Identity(accessControl: secAccessControl, pq: pq, crypto: self.crypto)
+    let identity = try Identity(
+      accessControl: secAccessControl, pq: pq,
+      requiresApplicationPassword: accessControl == .applicationPassword, crypto: self.crypto)
     let accessControlStr: String
     switch accessControl {
     case .none: accessControlStr = "none"
@@ -65,6 +83,7 @@ class Plugin {
     case .anyBiometryAndPasscode: accessControlStr = "any biometry and passcode"
     case .currentBiometry: accessControlStr = "current biometry"
     case .currentBiometryAndPasscode: accessControlStr = "current biometry and passcode"
+    case .applicationPassword: accessControlStr = "application password"
     }
 
     let ageRecipient: String
@@ -266,10 +285,18 @@ class Plugin {
     var errors: [Stanza] = []
 
     // Construct identities
+    let unlocker = ApplicationPasswordUnlocker(
+      crypto: crypto, agent: agent,
+      requestPassword: { try self.requestSecret($0) },
+      displayMessage: { self.displayMessage($0) })
     for (index, identity) in identities.enumerated() {
       do {
-        identityKeys.append(
-          (try Identity(ageIdentity: identity, crypto: crypto)))
+        var identityKey = try Identity(ageIdentity: identity, crypto: crypto)
+        if identityKey.requiresApplicationPassword {
+          identityKey.p256PrivateKey = ApplicationPasswordP256PrivateKey(
+            key: identityKey.p256PrivateKey, unlocker: unlocker)
+        }
+        identityKeys.append(identityKey)
       } catch {
         errors.append(
           Stanza(
@@ -360,11 +387,11 @@ class Plugin {
               let sharedSecret = try identity.p256PrivateKey
                 .sharedSecretFromKeyAgreement(
                   with: shareKey)
-              wrapKey = sharedSecret.hkdfDerivedSymmetricKey(
-                using: SHA256.self,
+              wrapKey = HKDF<SHA256>.deriveKey(
+                inputKeyMaterial: SymmetricKey(data: sharedSecret),
                 salt: shareKeyData
                   + identity.recipient.p256PublicKey.compressedRepresentation,
-                sharedInfo: Data("piv-p256".utf8),
+                info: Data("piv-p256".utf8),
                 outputByteCount: 32
               )
               nonce = try! ChaChaPoly.Nonce(data: Data(count: 12))
@@ -400,10 +427,7 @@ class Plugin {
               body: unwrappedKey
             )
           } catch {
-            Stanza(type: "msg", body: Data(error.localizedDescription.utf8)).writeTo(
-              stream: stream)
-            let resp = try! Stanza.readFrom(stream: self.stream)
-            assert(resp.type == "ok")
+            displayMessage(error.localizedDescription)
             // continue
           }
         }
@@ -419,6 +443,23 @@ class Plugin {
     Stanza(type: "done").writeTo(stream: stream)
   }
 
+  /// Shows a message to the user through the age client
+  func displayMessage(_ message: String) {
+    Stanza(type: "msg", body: Data(message.utf8)).writeTo(stream: stream)
+    let resp = try! Stanza.readFrom(stream: self.stream)
+    assert(resp.type == "ok")
+  }
+
+  /// Asks the user for a secret through the age client
+  func requestSecret(_ message: String) throws -> Data {
+    Stanza(type: "request-secret", body: Data(message.utf8)).writeTo(stream: stream)
+    let resp = try Stanza.readFrom(stream: stream)
+    if resp.type != "ok" {
+      throw Error.secretRequestFailed
+    }
+    return resp.body
+  }
+
   enum Error: LocalizedError, Equatable {
     case seUnsupported
     case pqUnsupported
@@ -428,6 +469,11 @@ class Plugin {
     case invalidRecipient
     case unknownHRP(String)
     case missingPQ
+    case applicationPasswordMissing
+    case applicationPasswordPQ
+    case applicationPasswordUnavailable
+    case incorrectApplicationPassword
+    case secretRequestFailed
 
     public var errorDescription: String? {
       switch self {
@@ -439,6 +485,12 @@ class Plugin {
       case .invalidRecipient: return "invalid recipient"
       case .unknownHRP(let hrp): return "unknown HRP: \(hrp)"
       case .missingPQ: return "missing post-quantum key support"
+      case .applicationPasswordMissing: return "missing application password"
+      case .applicationPasswordPQ:
+        return "post-quantum keys cannot be protected by an application password"
+      case .applicationPasswordUnavailable: return "unable to use application password"
+      case .incorrectApplicationPassword: return "incorrect password"
+      case .secretRequestFailed: return "password entry cancelled"
       }
     }
   }
@@ -503,6 +555,7 @@ enum KeyAccessControl {
   case anyBiometryAndPasscode
   case currentBiometry
   case currentBiometryAndPasscode
+  case applicationPassword
 }
 
 enum RecipientType: String {
@@ -589,14 +642,27 @@ struct Recipient {
 }
 
 struct Identity {
-  let p256PrivateKey: SecureEnclaveP256PrivateKey
+  /// Prefix marking keys protected by an application password. Cannot be confused with a key
+  /// blob or with the post-quantum container (whose first field length is never 0).
+  static let applicationPasswordMarker = Data([0x00, 0x00, 0x70, 0x77])
+
+  var p256PrivateKey: SecureEnclaveP256PrivateKey
   let mlkemPrivateKey: SecureEnclaveMLKEM768PrivateKey?
+  let requiresApplicationPassword: Bool
 
   init(ageIdentity: String, crypto: Crypto) throws {
     let id = try Bech32().decode(ageIdentity)
     if id.hrp != "AGE-PLUGIN-SE-" {
       throw Plugin.Error.unknownHRP(id.hrp)
     }
+    if id.data.starts(with: Identity.applicationPasswordMarker) {
+      self.p256PrivateKey = try crypto.newSecureEnclaveP256PrivateKey(
+        dataRepresentation: Data(id.data.dropFirst(Identity.applicationPasswordMarker.count)))
+      self.mlkemPrivateKey = nil
+      self.requiresApplicationPassword = true
+      return
+    }
+    self.requiresApplicationPassword = false
     do {
       let (p256Data, mlkemData) = Identity.parseData(id.data)
       if mlkemData != nil {
@@ -614,7 +680,11 @@ struct Identity {
     self.mlkemPrivateKey = nil
   }
 
-  init(accessControl: SecAccessControl, pq: Bool, crypto: Crypto) throws {
+  init(
+    accessControl: SecAccessControl, pq: Bool, requiresApplicationPassword: Bool = false,
+    crypto: Crypto
+  ) throws {
+    self.requiresApplicationPassword = requiresApplicationPassword
     self.p256PrivateKey = try crypto.newSecureEnclaveP256PrivateKey(
       accessControl: accessControl)
     if pq {
@@ -667,7 +737,9 @@ struct Identity {
 
   var ageIdentity: String {
     var data: Data
-    if self.mlkemPrivateKey == nil {
+    if self.requiresApplicationPassword {
+      data = Identity.applicationPasswordMarker + self.p256PrivateKey.dataRepresentation
+    } else if self.mlkemPrivateKey == nil {
       data = self.p256PrivateKey.dataRepresentation
     } else {
       let p256data = self.p256PrivateKey.dataRepresentation
