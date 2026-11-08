@@ -83,7 +83,7 @@ enum OutputError: LocalizedError {
   public var errorDescription: String? {
     switch self {
     case .exists(let path): return "output file already exists: \(path)"
-    case .missingDirectory(let path): return "directory does not exist: \(path)"
+    case .missingDirectory(let path): return "cannot create directory: \(path)"
     case .writeFailed(let path): return "cannot write output file: \(path)"
     }
   }
@@ -94,12 +94,14 @@ func checkOutputFile(_ path: String) throws {
     throw OutputError.exists(path)
   }
   let directory = (path as NSString).deletingLastPathComponent
-  var isDirectory: ObjCBool = false
-  if !directory.isEmpty
-    && !(FileManager.default.fileExists(atPath: directory, isDirectory: &isDirectory)
-      && isDirectory.boolValue)
-  {
-    throw OutputError.missingDirectory(directory)
+  if !directory.isEmpty {
+    do {
+      try FileManager.default.createDirectory(
+        atPath: directory, withIntermediateDirectories: true,
+        attributes: [.posixPermissions: 0o700])
+    } catch {
+      throw OutputError.missingDirectory(directory)
+    }
   }
 }
 
