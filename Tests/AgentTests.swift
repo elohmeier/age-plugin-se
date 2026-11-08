@@ -281,8 +281,13 @@ final class ApplicationPasswordIdentityTests: XCTestCase {
 }
 
 /// Key store that requires the password "secret" for all keys (which are raw P-256 keys)
-struct DummyKeyStore: AgentKeyStore {
+class DummyKeyStore: AgentKeyStore {
+  var unavailable = false
+
   func authorize(key: Data, password: Data) throws -> AnyObject {
+    if unavailable {
+      throw AgentError.unavailable("unavailable")
+    }
     if password != Data("secret".utf8) {
       throw AgentError.badPassword
     }
@@ -292,6 +297,9 @@ struct DummyKeyStore: AgentKeyStore {
   func sharedSecret(key: Data, authorization: AnyObject, share: P256.KeyAgreement.PublicKey)
     throws -> Data
   {
+    if unavailable {
+      throw AgentError.unavailable("unavailable")
+    }
     return try P256.KeyAgreement.PrivateKey(rawRepresentation: key)
       .sharedSecretFromKeyAgreement(with: share).withUnsafeBytes { Data($0) }
   }
@@ -329,6 +337,18 @@ final class AgentStateTests: XCTestCase {
     XCTAssertTrue(unlock(state, "secret").ok)
     XCTAssertTrue(state.handle(AgentRequest(op: "lock")).ok)
     XCTAssertEqual("locked", ecdh(state).error)
+  }
+
+  func testUnavailable() throws {
+    let keyStore = DummyKeyStore()
+    let state = AgentState(keyStore: keyStore)
+    XCTAssertTrue(unlock(state, "secret").ok)
+    keyStore.unavailable = true
+    XCTAssertEqual("unavailable", ecdh(state).error)
+    XCTAssertEqual("unavailable", unlock(state, "secret").error)
+    keyStore.unavailable = false
+    // Still unlocked afterwards
+    XCTAssertTrue(ecdh(state).ok)
   }
 
   func testTimeout() throws {

@@ -15,6 +15,7 @@ protocol AgentClient {
 enum AgentError: LocalizedError, Equatable {
   case locked
   case badPassword
+  case unavailable(String)
   case invalid(String)
   case `internal`(String)
 
@@ -22,6 +23,7 @@ enum AgentError: LocalizedError, Equatable {
     switch self {
     case .locked: return "locked"
     case .badPassword: return "bad-password"
+    case .unavailable: return "unavailable"
     case .invalid: return "invalid"
     case .internal: return "internal"
     }
@@ -31,6 +33,7 @@ enum AgentError: LocalizedError, Equatable {
     switch code {
     case "locked": self = .locked
     case "bad-password": self = .badPassword
+    case "unavailable": self = .unavailable(message)
     case "invalid": self = .invalid(message)
     default: self = .internal(message)
     }
@@ -40,6 +43,7 @@ enum AgentError: LocalizedError, Equatable {
     switch self {
     case .locked: return "key is locked"
     case .badPassword: return "incorrect password"
+    case .unavailable(let message): return message
     case .invalid(let message): return "invalid agent request: \(message)"
     case .internal(let message): return "agent error: \(message)"
     }

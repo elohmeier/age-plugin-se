@@ -61,7 +61,12 @@ class Plugin {
       var error: Unmanaged<CFError>?
       guard
         let secAccessControl = SecAccessControlCreateWithFlags(
-          kCFAllocatorDefault, kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
+          kCFAllocatorDefault,
+          // Application password keys are unlocked once (per boot, with the agent), and should
+          // keep working while the screen is locked (e.g. for background jobs).
+          accessControl == .applicationPassword
+            ? kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+            : kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
           accessControlFlags,
           &error)
       else {

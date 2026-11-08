@@ -54,6 +54,12 @@ LaunchAgent (`~/Library/LaunchAgents/age-plugin-se-agent.plist`):
 </plist>
 ```
 
+Application password keys are usable from the first unlock after boot
+(`kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`), so an unlocked agent keeps working while
+the screen is locked, e.g. for background jobs or SSH sessions. Other keys are only usable
+while the Mac is unlocked; for those, the agent reports `unavailable` while the Mac is locked,
+and keeps them unlocked.
+
 Post-quantum keys cannot be protected by an application password: the Secure Enclave refuses
 ML-KEM operations on such keys.
 
@@ -86,8 +92,9 @@ All binary values are standard base64 with padding. `key` is the Secure Enclave 
 | `{"op":"ecdh","key":K,"share":S}` | `{"ok":true,"secret":X}`. X is the raw P-256 ECDH shared secret (x-coordinate); S is an uncompressed (65-byte) P-256 point. |
 
 Error response: `{"ok":false,"error":E,"message":"…"}`, where E is `locked` (the plug-in asks
-for the password through age, sends `unlock`, and retries), `bad-password`, `invalid`, or
-`internal`.
+for the password through age, sends `unlock`, and retries), `bad-password`, `unavailable`
+(the key cannot be used right now, e.g. while the Mac is locked; the key stays unlocked),
+`invalid`, or `internal`.
 
 The same protocol is implemented by the TPM agent of the age-plugin-tpm fork, where `key` is
 the TPM identity.

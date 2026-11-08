@@ -99,6 +99,9 @@ final class AgentState: @unchecked Sendable {
           return AgentResponse(
             secret: try keyStore.sharedSecret(
               key: key, authorization: entry.authorization, share: share))
+        } catch let error as AgentError {
+          // The key cannot be used right now (e.g. the Mac is locked), but stays unlocked
+          throw error
         } catch {
           // The authorization may have been invalidated by the system
           entries[id] = nil
@@ -154,18 +157,32 @@ final class AgentState: @unchecked Sendable {
         let _: SharedSecret = try privateKey.sharedSecretFromKeyAgreement(
           with: P256.KeyAgreement.PrivateKey().publicKey)
       } catch {
-        throw AgentError.badPassword
+        throw SecureEnclaveKeyStore.unavailableError(error) ?? AgentError.badPassword
       }
       return context
+    }
+
+    /// Keys that are only accessible when the Mac is unlocked fail with
+    /// errSecInteractionNotAllowed while it is locked, regardless of the password.
+    static func unavailableError(_ error: Error) -> AgentError? {
+      let error = error as NSError
+      if error.domain == NSOSStatusErrorDomain && error.code == Int(errSecInteractionNotAllowed) {
+        return .unavailable("Secure Enclave key cannot be used while the Mac is locked")
+      }
+      return nil
     }
 
     func sharedSecret(key: Data, authorization: AnyObject, share: P256.KeyAgreement.PublicKey)
       throws -> Data
     {
-      let privateKey = try SecureEnclave.P256.KeyAgreement.PrivateKey(
-        dataRepresentation: key, authenticationContext: authorization as? LAContext)
-      let sharedSecret: SharedSecret = try privateKey.sharedSecretFromKeyAgreement(with: share)
-      return sharedSecret.withUnsafeBytes { Data($0) }
+      do {
+        let privateKey = try SecureEnclave.P256.KeyAgreement.PrivateKey(
+          dataRepresentation: key, authenticationContext: authorization as? LAContext)
+        let sharedSecret: SharedSecret = try privateKey.sharedSecretFromKeyAgreement(with: share)
+        return sharedSecret.withUnsafeBytes { Data($0) }
+      } catch {
+        throw SecureEnclaveKeyStore.unavailableError(error) ?? error
+      }
     }
   }
 
